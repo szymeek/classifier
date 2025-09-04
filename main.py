@@ -5,6 +5,24 @@ import csv
 import json
 from pathlib import Path
 
+def preprocess_image(image):
+    """Apply preprocessing to improve template matching accuracy"""
+    print("    Applying preprocessing...")
+    
+    # 1. Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(image, (3, 3), 0)
+    
+    # 2. Enhance contrast using CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(blurred)
+    
+    # 3. Apply sharpening to enhance edges
+    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+    sharpened = cv2.filter2D(enhanced, -1, kernel)
+    
+    print("    Preprocessing complete: blur → contrast enhancement → sharpening")
+    return sharpened
+
 def load_templates(folder_path):
     """Load all template images from a folder"""
     templates = []
@@ -19,56 +37,17 @@ def load_templates(folder_path):
             img_path = os.path.join(folder_path, filename)
             img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
             if img is not None:
-                templates.append(img)
+                # Apply same preprocessing to templates for consistency
+                img_preprocessed = preprocess_image(img)
+                templates.append(img_preprocessed)
                 template_files.append(filename)
-                print(f"Loaded template: {filename} - Shape: {img.shape}")
+                print(f"Loaded & preprocessed template: {filename} - Shape: {img.shape}")
     
     return templates, template_files
 
-def apply_non_max_suppression(matches, overlap_threshold=0.3):
-    """Apply Non-Maximum Suppression to remove overlapping detections"""
-    if len(matches) == 0:
-        return []
-    
-    # Convert matches to format needed for NMS
-    boxes = []
-    scores = []
-    
-    for match in matches:
-        # Format: [x, y, x+width, y+height]
-        box = [match['x'], match['y'], match['x'] + match['width'], match['y'] + match['height']]
-        boxes.append(box)
-        scores.append(match['confidence'])
-    
-    boxes = np.array(boxes, dtype=np.float32)
-    scores = np.array(scores, dtype=np.float32)
-    
-    # Apply NMS
-    indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), score_threshold=0.5, nms_threshold=overlap_threshold)
-    
-    # Handle different return types from cv2.dnn.NMSBoxes safely
-    filtered_matches = []
-    if indices is not None and len(indices) > 0:
-        # Safely extract indices regardless of format
-        indices_flat = []
-        for idx in indices:
-            if isinstance(idx, (list, tuple, np.ndarray)):
-                # Handle case where idx is [0] or (0,) or array([0])
-                indices_flat.append(int(idx[0]))
-            else:
-                # Handle case where idx is already an integer: 0
-                indices_flat.append(int(idx))
-        
-        # Filter matches based on NMS results
-        for i in indices_flat:
-            if 0 <= i < len(matches):  # Safety check for valid index
-                filtered_matches.append(matches[i])
-    
-    return filtered_matches
-
-def find_template_matches(image, templates, threshold=0.8):
-    """Find all matches for templates with improved duplicate filtering"""
-    all_matches = []
+def find_best_template_match(image, templates, threshold=0.85):
+    """Find the single best match with highest confidence across all templates"""
+    best_match = None
     max_confidence = 0.0
     
     for i, template in enumerate(templates):
@@ -82,39 +61,30 @@ def find_template_matches(image, templates, threshold=0.8):
         # Perform template matching
         result = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
         
-        # Find locations where matching result is above threshold
-        locations = np.where(result >= threshold)
+        # Find the best match location for this template
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
         
-        # Store match information with bounding boxes
-        template_matches = []
-        for pt in zip(*locations[::-1]):  # Switch x and y coordinates
-            x, y = pt
-            confidence = result[y, x]
-            max_confidence = max(max_confidence, confidence)
+        # Check if this is the best match so far and above threshold
+        if max_val > max_confidence and max_val >= threshold:
+            max_confidence = max_val
+            x, y = max_loc
             
-            bbox = {
+            best_match = {
                 'x': int(x),
                 'y': int(y), 
                 'width': int(w),
                 'height': int(h),
-                'confidence': float(confidence),
+                'confidence': float(max_val),
                 'template_idx': i
             }
-            template_matches.append(bbox)
-        
-        # Apply NMS to this template's matches
-        if template_matches:
-            filtered_matches = apply_non_max_suppression(template_matches, overlap_threshold=0.3)
-            all_matches.extend(filtered_matches)
-            print(f"    Template {i}: {len(template_matches)} raw matches -> {len(filtered_matches)} after NMS")
     
-    # Apply final NMS across all templates
-    if all_matches:
-        final_matches = apply_non_max_suppression(all_matches, overlap_threshold=0.2)
-        print(f"    Final: {len(all_matches)} total matches -> {len(final_matches)} after cross-template NMS")
-        return final_matches, max_confidence
-    
-    return [], max_confidence
+    # Return single best match or empty list
+    if best_match:
+        print(f"    Best match: confidence {max_confidence:.4f} at ({best_match['x']},{best_match['y']})")
+        return [best_match], max_confidence
+    else:
+        print(f"    No matches above threshold {threshold}")
+        return [], 0.0
 
 def format_bounding_boxes(matches):
     """Format bounding boxes as string for CSV storage"""
@@ -159,23 +129,23 @@ def crop_and_save_glyphs(screenshot, matches, screenshot_file, output_folder, gl
         # Crop the glyph area
         cropped_glyph = screenshot[y:y+h, x:x+w]
         
-        # Generate filename for cropped glyph
+        # Generate filename for cropped glyph (single file per type)
         base_name = Path(screenshot_file).stem
-        crop_filename = f"{base_name}_{glyph_type}_{idx:02d}_conf{bbox['confidence']:.3f}.png"
+        crop_filename = f"{base_name}_{glyph_type}_conf{bbox['confidence']:.3f}.png"
         crop_path = os.path.join(output_folder, crop_filename)
         
         # Save cropped glyph
         success = cv2.imwrite(crop_path, cropped_glyph)
         if success:
             cropped_files.append(crop_filename)
-            print(f"    Saved crop: {crop_filename} (pos: {x},{y}, size: {w}x{h})")
+            print(f"    Saved: {crop_filename} (pos: {x},{y}, size: {w}x{h})")
         else:
             print(f"    Failed to save: {crop_filename}")
     
     return cropped_files
 
 def process_screenshots():
-    """Main function to process all screenshots and save results with bounding boxes and crops"""
+    """Main function to process screenshots with preprocessing and save only the best match per glyph type"""
     
     # Paths
     templates_e_path = 'templates/e'
@@ -184,13 +154,14 @@ def process_screenshots():
     output_folder = os.path.join(screenshots_path, 'output')
     results_file = '_results.csv'
     
-    print("=== Python Image Classifier with NMS and Bounding Box Detection ===")
+    print("=== Python Image Classifier - With Preprocessing ===")
+    print("Mode: Single highest confidence detection per glyph type")
     print("Template matching threshold: 0.8 (increased for better precision)")
-    print("Non-Maximum Suppression: Enabled")
+    print("Preprocessing: Gaussian Blur → CLAHE Contrast Enhancement → Sharpening")
     print()
-    print("Loading templates...")
+    print("Loading and preprocessing templates...")
     
-    # Load templates
+    # Load and preprocess templates
     templates_e, e_files = load_templates(templates_e_path)
     templates_q, q_files = load_templates(templates_q_path)
     
@@ -238,21 +209,24 @@ def process_screenshots():
         print(f"\nProcessing: {screenshot_file}")
         
         img_path = os.path.join(screenshots_path, screenshot_file)
-        screenshot = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        original_screenshot = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         
-        if screenshot is None:
+        if original_screenshot is None:
             print(f"Warning: Could not load {screenshot_file}")
             continue
         
-        print(f"  Screenshot size: {screenshot.shape[1]}x{screenshot.shape[0]}")
+        print(f"  Original screenshot size: {original_screenshot.shape[1]}x{original_screenshot.shape[0]}")
         
-        # Find matches for 'e' templates
-        print("  Searching for 'e' glyphs...")
-        e_matches, e_max_conf = find_template_matches(screenshot, templates_e)
+        # Apply preprocessing to screenshot
+        preprocessed_screenshot = preprocess_image(original_screenshot)
         
-        # Find matches for 'q' templates  
-        print("  Searching for 'q' glyphs...")
-        q_matches, q_max_conf = find_template_matches(screenshot, templates_q)
+        # Find best match for 'e' templates on preprocessed image
+        print("  Searching for best 'e' glyph...")
+        e_matches, e_max_conf = find_best_template_match(preprocessed_screenshot, templates_e)
+        
+        # Find best match for 'q' templates on preprocessed image
+        print("  Searching for best 'q' glyph...")
+        q_matches, q_max_conf = find_best_template_match(preprocessed_screenshot, templates_q)
         
         # Determine if glyphs are present
         has_e = len(e_matches) > 0
@@ -264,10 +238,10 @@ def process_screenshots():
         e_positions_json = format_positions_json(e_matches)
         q_positions_json = format_positions_json(q_matches)
         
-        # Crop and save detected glyphs
-        print("  Cropping detected glyphs...")
-        e_crop_files = crop_and_save_glyphs(screenshot, e_matches, screenshot_file, output_folder, 'e')
-        q_crop_files = crop_and_save_glyphs(screenshot, q_matches, screenshot_file, output_folder, 'q')
+        # Crop from ORIGINAL screenshot (not preprocessed) for better visual quality
+        print("  Cropping best detections from original image...")
+        e_crop_files = crop_and_save_glyphs(original_screenshot, e_matches, screenshot_file, output_folder, 'e')
+        q_crop_files = crop_and_save_glyphs(original_screenshot, q_matches, screenshot_file, output_folder, 'q')
         
         total_crops_saved += len(e_crop_files) + len(q_crop_files)
         
@@ -291,9 +265,9 @@ def process_screenshots():
         results.append(result_row)
         
         print(f"  RESULTS:")
-        print(f"    - Contains 'e': {has_e} (max confidence: {e_max_conf:.4f}, unique detections: {len(e_matches)})")
-        print(f"    - Contains 'q': {has_q} (max confidence: {q_max_conf:.4f}, unique detections: {len(q_matches)})")
-        print(f"    - Cropped files: {len(e_crop_files)} 'e' + {len(q_crop_files)} 'q'")
+        print(f"    - Contains 'e': {has_e} (confidence: {e_max_conf:.4f})")
+        print(f"    - Contains 'q': {has_q} (confidence: {q_max_conf:.4f})")
+        print(f"    - Output files: {len(e_crop_files) + len(q_crop_files)} total")
     
     # Save results to CSV
     print(f"\nSaving results to {results_file}")
@@ -323,8 +297,8 @@ def process_screenshots():
     print(f"Successfully processed: {successful_processed}")
     print(f"Screenshots containing 'e': {screenshots_with_e}")
     print(f"Screenshots containing 'q': {screenshots_with_q}")
-    print(f"Total unique 'e' detections: {total_e_detections}")
-    print(f"Total unique 'q' detections: {total_q_detections}")
+    print(f"Total 'e' detections: {total_e_detections}")
+    print(f"Total 'q' detections: {total_q_detections}")
     print(f"Total cropped files saved: {total_crops_saved}")
     print(f"Results saved to: {results_file}")
     print(f"Cropped glyphs saved to: {output_folder}")
